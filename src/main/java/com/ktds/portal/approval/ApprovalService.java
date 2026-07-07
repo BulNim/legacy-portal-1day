@@ -12,7 +12,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 /**
- * 결재 서비스 — 이 클래스가 이 과정의 "주인공 안티패턴"이다.
+ * 결재 서비스 - 이 클래스가 이 과정의 "주인공 안티패턴"이다.
  *
  * ============================== [리팩토링 6장] 이번 라운드 변경 사항 ==============================
  * (1) 매직넘버 → enum   : status/type/priority(Approval), role(User), action(처리 구분)을 각각
@@ -41,7 +41,7 @@ public class ApprovalService {
     private final ApprovalRepository repo;
     private final UserRepository userRepo;
 
-    // [스멜5] 강결합 — 협력 객체를 생성자 주입 없이 직접 new 한다. 테스트에서 갈아끼울 수 없다. (이번 라운드 범위 밖)
+    // [스멜5] 강결합 - 협력 객체를 생성자 주입 없이 직접 new 한다. 테스트에서 갈아끼울 수 없다. (이번 라운드 범위 밖)
     private final SmtpMailSender mail = new SmtpMailSender();
     private final FileAuditLogger audit = new FileAuditLogger();
 
@@ -68,7 +68,7 @@ public class ApprovalService {
         approval.setUpdatedAt(LocalDateTime.now());
         repo.save(approval);
 
-        // [스멜4] 감사 로그 기록 — 이 6줄이 submit/approve/reject/cancel 에도 복붙 되어 있다(이번 라운드 범위 밖).
+        // [스멜4] 감사 로그 기록 - 이 6줄이 submit/approve/reject/cancel 에도 복붙 되어 있다(이번 라운드 범위 밖).
         String now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
         String line = "[" + now + "] APPROVAL CREATE id=" + approval.getId()
                 + " by=" + drafterId + " type=" + approval.getType();
@@ -77,96 +77,137 @@ public class ApprovalService {
     }
 
     /**
-     * 결재 처리 — 상신/승인/반려/취소를 action 코드로 분기한다.
+     * 결재 처리 - 상신/승인/반려/취소를 action 코드로 분기한다.
      * [스멜2] 이 메서드 하나가 모든 일을 한다(이번 라운드 범위 밖). [계약 보존] 시그니처는 그대로 유지한다.
      *
      * action: 1=상신, 2=승인, 3=반려, 9=취소 (ApprovalAction 참고)
      */
+    // [리팩토링] 레거시 → 여기서 변경: Long Method(스멜2) + 깊은 중첩 해소.
+    //   (1) null·존재하지 않는 대상 체크를 guard clause 로 빼서 조기 반환(기존엔 나머지 로직이 if 블록 안에 중첩).
+    //   (2) 상신/승인/반려/취소 4개 분기를 submit/approve/reject/cancel private 메서드로 추출.
+    //   외부 시그니처 processApproval(id, userId, action, reason) 과 동작(각 분기의 조건·순서·부수효과)은 100% 동일 -
+    //   ApprovalServiceCharacterizationTest 는 한 글자도 고치지 않고 그대로 green.
     public void processApproval(Long id, Long userId, int action, String reason) {
+        // [Guard Clause] 결재 문서가 없으면 조기 반환
         Approval approval = repo.findById(id).orElse(null);
         if (approval == null) {
-            // [스멜] 예외 대신 조용히 리턴 — 호출자는 실패를 알 수 없다(레거시 결함, 보존 대상).
+            // [스멜] 예외 대신 조용히 리턴 - 호출자는 실패를 알 수 없다(레거시 결함, 보존 대상).
             return;
         }
+        // [Guard Clause] 처리자 계정이 없으면 조기 반환
         User user = userRepo.findById(userId).orElse(null);
         if (user == null) {
             return;
         }
 
-        ApprovalStatus currentStatus = approval.getStatusEnum();
         // [동작 보존] 정의되지 않은 action 코드는 null 이 되어 아래 어떤 분기에도 해당하지 않는다(조용히 무시).
         ApprovalAction requestedAction = ApprovalAction.fromCode(action);
 
         if (requestedAction == ApprovalAction.SUBMIT) {
-            // 상신: 임시저장 상태일 때만 가능
-            if (currentStatus == ApprovalStatus.DRAFT) {
-                // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다(이번 라운드 범위 밖).
-                if (approval.getTypeEnum() == ApprovalType.EXPENSE && approval.getAmount() >= 1000000) {
-                    approval.setPriority(ApprovalPriority.HIGH.getCode());
-                }
-                approval.setStatus(ApprovalStatus.SUBMITTED.getCode());
-                approval.setUpdatedAt(LocalDateTime.now());
-                repo.save(approval);
-                // [스멜4] 메일 발송 — 본문 생성 로직이 곳곳에 복붙(이번 라운드 범위 밖).
-                User approver = userRepo.findById(approval.getApproverId()).orElse(null);
-                if (approver != null) {
-                    String body = "안녕하세요 " + approver.getName() + "님,\n"
-                            + "결재 요청이 도착했습니다.\n제목: " + approval.getTitle()
-                            + "\n기안자ID: " + approval.getDrafterId();
-                    mail.send(approver.getEmail(), "[결재요청] " + approval.getTitle(), body);
-                }
-                writeAudit("APPROVAL SUBMIT", approval.getId(), userId);
-            }
+            submit(approval, userId);
         } else if (requestedAction == ApprovalAction.APPROVE) {
-            // 승인: 상신 상태 + 본인이 결재자 + 결재 권한(팀장 이상)일 때만
-            if (currentStatus == ApprovalStatus.SUBMITTED) {
-                if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
-                    if (hasApprovalAuthority(user)) {
-                        approval.setStatus(ApprovalStatus.APPROVED.getCode());
-                        approval.setUpdatedAt(LocalDateTime.now());
-                        repo.save(approval);
-                        // [스멜4] 또 복붙된 메일 발송(이번 라운드 범위 밖)
-                        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
-                        if (drafter != null) {
-                            String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                                    + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
-                            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), body);
-                        }
-                        writeAudit("APPROVAL APPROVE", approval.getId(), userId);
-                    }
-                }
-            }
+            approve(approval, user, userId);
         } else if (requestedAction == ApprovalAction.REJECT) {
-            // 반려: 상신 상태 + 본인이 결재자 + 결재 권한(팀장 이상)일 때만
-            if (currentStatus == ApprovalStatus.SUBMITTED) {
-                if (approval.getApproverId() != null && approval.getApproverId().equals(userId)) {
-                    if (hasApprovalAuthority(user)) {
-                        approval.setStatus(ApprovalStatus.REJECTED.getCode());
-                        approval.setRejectReason(reason);
-                        approval.setUpdatedAt(LocalDateTime.now());
-                        repo.save(approval);
-                        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
-                        if (drafter != null) {
-                            String body = "안녕하세요 " + drafter.getName() + "님,\n"
-                                    + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
-                                    + "\n사유: " + reason;
-                            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), body);
-                        }
-                        writeAudit("APPROVAL REJECT", approval.getId(), userId);
-                    }
-                }
-            }
+            reject(approval, user, userId, reason);
         } else if (requestedAction == ApprovalAction.CANCEL) {
-            // 취소: 기안자 본인 + 아직 승인 전(임시저장 또는 상신)
-            if (currentStatus == ApprovalStatus.DRAFT || currentStatus == ApprovalStatus.SUBMITTED) {
-                if (approval.getDrafterId() != null && approval.getDrafterId().equals(userId)) {
-                    approval.setStatus(ApprovalStatus.CANCELED.getCode());
-                    approval.setUpdatedAt(LocalDateTime.now());
-                    repo.save(approval);
-                    writeAudit("APPROVAL CANCEL", approval.getId(), userId);
-                }
-            }
+            cancel(approval, userId);
         }
+    }
+
+    // 상신: 임시저장 상태일 때만 가능
+    private void submit(Approval approval, Long userId) {
+        // [상태 전이 가드] DRAFT 일 때만 상신 - 위반 시 조용히 무시(레거시 동작 보존)
+        if (approval.getStatusEnum() != ApprovalStatus.DRAFT) {
+            return;
+        }
+        // [스멜6] 금액 기준 결재자 자동 상향 - 도메인 규칙이 서비스에 박혀 있다(이번 라운드 범위 밖).
+        if (approval.getTypeEnum() == ApprovalType.EXPENSE && approval.getAmount() >= 1000000) {
+            approval.setPriority(ApprovalPriority.HIGH.getCode());
+        }
+        approval.setStatus(ApprovalStatus.SUBMITTED.getCode());
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        // [스멜4] 메일 발송 - 본문 생성 로직이 곳곳에 복붙(이번 라운드 범위 밖).
+        User approver = userRepo.findById(approval.getApproverId()).orElse(null);
+        if (approver != null) {
+            String body = "안녕하세요 " + approver.getName() + "님,\n"
+                    + "결재 요청이 도착했습니다.\n제목: " + approval.getTitle()
+                    + "\n기안자ID: " + approval.getDrafterId();
+            mail.send(approver.getEmail(), "[결재요청] " + approval.getTitle(), body);
+        }
+        writeAudit("APPROVAL SUBMIT", approval.getId(), userId);
+    }
+
+    // 승인: 상신 상태 + 본인이 결재자 + 결재 권한(팀장 이상)일 때만
+    private void approve(Approval approval, User user, Long userId) {
+        // [상태 전이 가드] SUBMITTED 일 때만 승인 가능 - 위반 시 조용히 무시(레거시 동작 보존)
+        if (approval.getStatusEnum() != ApprovalStatus.SUBMITTED) {
+            return;
+        }
+        // [권한 가드] 지정된 결재자 본인이 아니면 조용히 무시(레거시 동작 보존)
+        if (approval.getApproverId() == null || !approval.getApproverId().equals(userId)) {
+            return;
+        }
+        // [권한 가드] 결재 권한(팀장 이상)이 없으면 조용히 무시(레거시 동작 보존)
+        if (!hasApprovalAuthority(user)) {
+            return;
+        }
+        approval.setStatus(ApprovalStatus.APPROVED.getCode());
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        // [스멜4] 또 복붙된 메일 발송(이번 라운드 범위 밖)
+        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
+        if (drafter != null) {
+            String body = "안녕하세요 " + drafter.getName() + "님,\n"
+                    + "결재가 승인되었습니다.\n제목: " + approval.getTitle();
+            mail.send(drafter.getEmail(), "[결재승인] " + approval.getTitle(), body);
+        }
+        writeAudit("APPROVAL APPROVE", approval.getId(), userId);
+    }
+
+    // 반려: 상신 상태 + 본인이 결재자 + 결재 권한(팀장 이상)일 때만
+    private void reject(Approval approval, User user, Long userId, String reason) {
+        // [상태 전이 가드] SUBMITTED 일 때만 반려 가능 - 위반 시 조용히 무시(레거시 동작 보존)
+        if (approval.getStatusEnum() != ApprovalStatus.SUBMITTED) {
+            return;
+        }
+        // [권한 가드] 지정된 결재자 본인이 아니면 조용히 무시(레거시 동작 보존)
+        if (approval.getApproverId() == null || !approval.getApproverId().equals(userId)) {
+            return;
+        }
+        // [권한 가드] 결재 권한(팀장 이상)이 없으면 조용히 무시(레거시 동작 보존)
+        if (!hasApprovalAuthority(user)) {
+            return;
+        }
+        approval.setStatus(ApprovalStatus.REJECTED.getCode());
+        approval.setRejectReason(reason);
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        User drafter = userRepo.findById(approval.getDrafterId()).orElse(null);
+        if (drafter != null) {
+            String body = "안녕하세요 " + drafter.getName() + "님,\n"
+                    + "결재가 반려되었습니다.\n제목: " + approval.getTitle()
+                    + "\n사유: " + reason;
+            mail.send(drafter.getEmail(), "[결재반려] " + approval.getTitle(), body);
+        }
+        writeAudit("APPROVAL REJECT", approval.getId(), userId);
+    }
+
+    // 취소: 기안자 본인 + 아직 승인 전(임시저장 또는 상신)
+    private void cancel(Approval approval, Long userId) {
+        ApprovalStatus currentStatus = approval.getStatusEnum();
+        // [상태 전이 가드] DRAFT 또는 SUBMITTED 일 때만 취소 가능 - 위반 시 조용히 무시(레거시 동작 보존)
+        if (currentStatus != ApprovalStatus.DRAFT && currentStatus != ApprovalStatus.SUBMITTED) {
+            return;
+        }
+        // [권한 가드] 기안자 본인이 아니면 조용히 무시(레거시 동작 보존)
+        if (approval.getDrafterId() == null || !approval.getDrafterId().equals(userId)) {
+            return;
+        }
+        approval.setStatus(ApprovalStatus.CANCELED.getCode());
+        approval.setUpdatedAt(LocalDateTime.now());
+        repo.save(approval);
+        writeAudit("APPROVAL CANCEL", approval.getId(), userId);
     }
 
     // [매직넘버 → 도메인 메서드] 레거시의 "role >= 2" 판정을 UserRole.hasApprovalAuthority() 로 위임한다.
@@ -189,7 +230,7 @@ public class ApprovalService {
         return status == null ? "알수없음" : status.getLabel();
     }
 
-    // [스멜6] Feature Envy — Approval 데이터를 꺼내 금액 등급을 서비스가 계산한다(이번 라운드 범위 밖).
+    // [스멜6] Feature Envy - Approval 데이터를 꺼내 금액 등급을 서비스가 계산한다(이번 라운드 범위 밖).
     public String amountGrade(Approval approval) {
         long amount = approval.getAmount();
         if (amount >= 10000000) return "S";   // 1000만원=S
