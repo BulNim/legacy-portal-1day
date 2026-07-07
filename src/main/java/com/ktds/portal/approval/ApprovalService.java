@@ -45,12 +45,12 @@ public class ApprovalService {
     // [스멜8] 파라미터 8개. [스멜9] 이름이 모호하다.
     public Approval create(String title, String content, int type, int priority,
                            Long drafterId, Long approverId, long amount, boolean urgent) {
-        Approval d = new Approval();   // [스멜9] d = document? draft? 알 수 없다.
+        Approval d = new Approval();   // d = 결재 문서(Approval 객체)  [스멜9: document? draft? 약어라 의미 불명]
         d.setTitle(title);
         d.setContent(content);
         d.setType(type);
-        d.setPriority(urgent ? 3 : priority);   // [스멜3] 3 = 높음 (왜 3이 높음? 코드만 봐선 모름)
-        d.setStatus(0);                          // [스멜3] 0 = 임시저장 (DRAFT 라는 이름 대신 숫자 0)
+        d.setPriority(urgent ? 3 : priority);   // priority(우선순위): 1 낮음·2 보통·3 높음  [스멜3: 3=높음, 왜 3이 높음? 코드만 봐선 모름]
+        d.setStatus(0);                          // status(상태): 0 임시저장·1 상신·2 승인·3 반려·9 취소  [스멜3: 0=임시저장, DRAFT 대신 숫자 0]
         d.setDrafterId(drafterId);
         d.setApproverId(approverId);
         d.setAmount(amount);
@@ -73,25 +73,25 @@ public class ApprovalService {
      * action: 1=상신, 2=승인, 3=반려, 9=취소
      */
     public void processApproval(Long id, Long userId, int action, String reason) {
-        Approval d = repo.findById(id).orElse(null);
+        Approval d = repo.findById(id).orElse(null);   // d = 결재 문서(Approval 객체)
         if (d == null) {
             // [스멜] 예외 대신 조용히 리턴 — 호출자는 실패를 알 수 없다.
             return;
         }
-        User u = userRepo.findById(userId).orElse(null);
+        User u = userRepo.findById(userId).orElse(null);   // u = 사용자(User 객체)
         if (u == null) {
             return;
         }
 
-        int s = d.getStatus();     // [스멜9] s = status (한 글자라 의미 불명)
-        int proc = action;          // [스멜9] proc = ? action 을 다른 약어로 또 담음(의미 없음)
+        int s = d.getStatus();     // s = status(상태): 0 임시저장·1 상신·2 승인·3 반려·9 취소  [스멜9: 한 글자라 의미 불명]
+        int proc = action;          // proc = action(처리 구분): 1 상신·2 승인·3 반려·9 취소  [스멜9: action 을 다른 약어로 또 담음, 의미 없음]
 
         // [스멜2][스멜3] 거대한 if-지옥. 상태 전이 규칙이 숫자 비교로 흩어져 있다.
         if (proc == 1) {            // proc==1 → 상신 (숫자 1을 외워야 의미를 앎)
             // 상신: 임시저장(0)일 때만 가능
             if (s == 0) {           // s==0 → 임시저장 상태일 때만
                 // [스멜6] 금액 기준 결재자 자동 상향 — 도메인 규칙이 서비스에 박혀 있다.
-                if (d.getType() == 1 && d.getAmount() >= 1000000) {   // type==1(지출) && 100만원↑
+                if (d.getType() == 1 && d.getAmount() >= 1000000) {   // type 1=지출·2=휴가·3=구매·4=기타 → type==1(지출) && 100만원↑
                     d.setPriority(3);   // 3 = 높음
                 }
                 d.setStatus(1);   // 1 = 상신 (SUBMITTED)
@@ -111,7 +111,7 @@ public class ApprovalService {
             // 승인: 상신(1) 상태 + 본인이 결재자 + 권한(role>=2) 일 때만
             if (s == 1) {           // s==1 → 상신 상태일 때만 승인 가능
                 if (d.getApproverId() != null && d.getApproverId().equals(userId)) {
-                    if (u.getRole() >= 2) {   // [스멜3] role 2 = 팀장, 3 = 임원 (숫자로 권한 판정)
+                    if (u.getRole() >= 2) {   // role 1=사원·2=팀장·3=임원 (role>=2 승인권한)  [스멜3: 숫자로 권한 판정]
                         d.setStatus(2);        // 2 = 승인 (APPROVED)
                         d.setUpdatedAt(LocalDateTime.now());
                         repo.save(d);
@@ -167,8 +167,8 @@ public class ApprovalService {
 
     // [스멜1][스멜10] 화면 표시용 문자열까지 서비스가 만든다. 주석으로 매직넘버를 변명한다.
     public String statusLabel(Approval d) {
-        int s = d.getStatus();
-        String tmp;          // [스멜9] tmp = 임시? 결과 라벨이라는 의도가 안 드러남
+        int s = d.getStatus();   // s = status(상태): 0 임시저장·1 상신·2 승인·3 반려·9 취소
+        String tmp;          // tmp = 결과 라벨(반환할 상태 표시 문자열)  [스멜9: 임시? 의도가 안 드러남]
         if (s == 0) tmp = "임시저장";       // status 0~9 를 라벨로 번역 — 이 표가 곳곳에 중복
         else if (s == 1) tmp = "상신";
         else if (s == 2) tmp = "승인";
@@ -180,7 +180,7 @@ public class ApprovalService {
 
     // [스멜6] Feature Envy — Approval 데이터를 꺼내 금액 등급을 서비스가 계산.
     public String amountGrade(Approval d) {
-        long a = d.getAmount();   // [스멜9] a = amount
+        long a = d.getAmount();   // a = amount(금액, 원)  [스멜9: 한 글자 약어]
         if (a >= 10000000) return "S";   // [스멜3] 1000만원=S — 기준 숫자의 의미가 코드에 없음
         else if (a >= 1000000) return "A";   // 100만원=A
         else if (a >= 100000) return "B";    // 10만원=B
